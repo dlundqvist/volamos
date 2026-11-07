@@ -2121,11 +2121,9 @@ fn add_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let (dsecs, dmicro) = read_timeval(ctx.mem, dest);
     let (ssecs, smicro) = read_timeval(ctx.mem, src);
     let mut micro = u64::from(dmicro) + u64::from(smicro);
-    let mut secs = dsecs.wrapping_add(ssecs);
-    if micro >= 1_000_000 {
-        micro -= 1_000_000;
-        secs = secs.wrapping_add(1);
-    }
+    let secs_carry = (micro / 1_000_000) as u32;
+    micro %= 1_000_000;
+    let secs = dsecs.wrapping_add(ssecs).wrapping_add(secs_carry);
     write_timeval(ctx.mem, dest, secs, micro as u32);
     Ok(())
 }
@@ -2141,14 +2139,13 @@ fn sub_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let src = ctx.cpu.address_register(AddressRegister(1));
     let (dsecs, dmicro) = read_timeval(ctx.mem, dest);
     let (ssecs, smicro) = read_timeval(ctx.mem, src);
-    let mut secs = dsecs.wrapping_sub(ssecs);
-    let micro = if dmicro < smicro {
-        secs = secs.wrapping_sub(1);
-        dmicro + 1_000_000 - smicro
-    } else {
-        dmicro - smicro
-    };
-    write_timeval(ctx.mem, dest, secs, micro);
+    let mut secs_diff = (dsecs as i64) - (ssecs as i64);
+    let mut micro_diff = (dmicro as i64) - (smicro as i64);
+    while micro_diff < 0 {
+        secs_diff -= 1;
+        micro_diff += 1_000_000;
+    }
+    write_timeval(ctx.mem, dest, secs_diff as u32, micro_diff as u32);
     Ok(())
 }
 
@@ -4661,6 +4658,279 @@ mod tests {
             300_000,
             "AddTime tv_micro (carry path)"
         );
+    }
+
+    #[test]
+    fn add_time_normal_microseconds_carry() {
+        // (0s, 800_000µs) + (0s, 700_000µs) = (1s, 500_000µs). Normal carry
+        // path with valid microseconds (< 1_000_000 each).
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // AddTime
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 0);
+        mem.write_u32(dest_addr + 4, 800_000);
+        mem.write_u32(src_addr, 0);
+        mem.write_u32(src_addr + 4, 700_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.memory().read_u32(dest_addr), 1, "AddTime tv_secs");
+        assert_eq!(
+            rt.memory().read_u32(dest_addr + 4),
+            500_000,
+            "AddTime tv_micro"
+        );
+    }
+
+    #[test]
+    fn sub_time_borrow_wraps_seconds() {
+        // (0s, 0µs) - (1s, 0µs) = (-1s, 0µs) = (u32::MAX, 0). Tests that
+        // the borrow loop handles secs_diff = -1 correctly and wrapping.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // SubTime
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 0);
+        mem.write_u32(dest_addr + 4, 0);
+        mem.write_u32(src_addr, 1);
+        mem.write_u32(src_addr + 4, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            rt.memory().read_u32(dest_addr),
+            u32::MAX,
+            "SubTime tv_secs (wraps)"
+        );
+        assert_eq!(rt.memory().read_u32(dest_addr + 4), 0, "SubTime tv_micro");
+    }
+
+    #[test]
+    fn sub_time_normal_borrow() {
+        // (1s, 0µs) - (0s, 100_000µs) = (0s, 900_000µs). Normal single
+        // borrow path — verifies the loop works for the common case.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // SubTime
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 1);
+        mem.write_u32(dest_addr + 4, 0);
+        mem.write_u32(src_addr, 0);
+        mem.write_u32(src_addr + 4, 100_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.memory().read_u32(dest_addr), 0, "SubTime tv_secs");
+        assert_eq!(
+            rt.memory().read_u32(dest_addr + 4),
+            900_000,
+            "SubTime tv_micro"
+        );
+    }
+
+    #[test]
+    fn add_time_out_of_spec_micros() {
+        // (0s, 2_000_000µs) + (3s, 0us) = (5s, 0us).
+        // Micro > 1_000_000 is out of spec (must be normalized per
+        // timer.device docs) but the fix handles it correctly.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // AddTime
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 0);
+        mem.write_u32(dest_addr + 4, 2_000_000);
+        mem.write_u32(src_addr, 3);
+        mem.write_u32(src_addr + 4, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.memory().read_u32(dest_addr), 5, "AddTime tv_secs");
+        assert_eq!(rt.memory().read_u32(dest_addr + 4), 0, "AddTime tv_micro");
+    }
+
+    #[test]
+    fn sub_time_out_of_spec_micros() {
+        // (4s, 0µs) - (0s, 2_000_000µs) = (2s, 0µs).
+        // Micro > 1_000_000 is out of spec but handled correctly.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // SubTime
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 4);
+        mem.write_u32(dest_addr + 4, 0);
+        mem.write_u32(src_addr, 0);
+        mem.write_u32(src_addr + 4, 2_000_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.memory().read_u32(dest_addr), 2, "SubTime tv_secs");
+        assert_eq!(rt.memory().read_u32(dest_addr + 4), 0, "SubTime tv_micro");
     }
 
     #[test]
